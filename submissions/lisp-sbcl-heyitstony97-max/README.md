@@ -44,15 +44,19 @@ Built by Anthony Taylor directing AI coding agents.
    The saved executable re-opens `shim.so` from the recorded absolute path, so it starts from any
    directory.
 
-`start.sh` execs `bin/server`, which reads `SQLITE_PATH`, `JWT_SECRET`, `HOST` and `PORT` and nothing else
-(`CONSED_LOG=1` additionally prints bytes consed and the request count to stderr on SIGUSR1 and on exit;
-it is a measuring aid, not an endpoint).
+`start.sh` execs `bin/server`, which is configured by `SQLITE_PATH`, `JWT_SECRET`, `HOST` and `PORT` only.
+Optional variables exist for measuring and testing and are never set on the benchmark box: `STATS=1` (a
+counter line on stderr every 5 s), `CONSED_LOG=1` (bytes consed and the request count on SIGUSR1 and on
+exit), `TUNE`, `NO_BTREE`, `PERFMAP`, for M8 `PULSE_MS` (write pulse, default 20; 0 commits in every
+pass), `CKPT_FRAMES` (4096), `CKPT_FORCE` (65536) and `CKPT_DELAY_MS` (0; delays the checkpoint thread
+like a slow disk), and the four M9 switches, all off by default: `WALBUF=1`, `INLINE=1`, `PULSE_MAX_MS=n`
+and `QUEUE=newest`.
 
 ## Layout
 
 | File | What |
 |---|---|
-| `csrc/shim.c` | SQLite amalgamation plus `shim_open` (unix-excl VFS, pragmas) and `shim_prepare` |
+| `csrc/shim.c` | SQLite amalgamation plus `shim_open` (unix-excl VFS, pragmas), `shim_prepare`, the B-tree cursor wrappers, the checkpoint thread and the optional WAL-buffering VFS (`WALBUF=1`) |
 | `src/tune.lisp` | every tunable in one place: ring sizes, batch caps, turn-time target, `io_uring_enter` wait |
 | `src/ffi.lisp` | libc and io_uring syscalls and `sqlite3_*` entry points as `sb-alien` routines |
 | `src/http.lisp` | request parser over foreign memory (split reads, pipelining, `Expect: 100-continue`), fixed responses as precomputed octet vectors, response header writer |
@@ -61,6 +65,7 @@ it is a measuring aid, not an endpoint).
 | `src/db.lisp` | prepared statements kept for the life of the process; group-commit transaction |
 | `src/btree.lisp` | B-tree cursor reads and record decoders for `/feed`, `/posts/:id`, like existence |
 | `tools/equiv.sh` | B-tree path vs SQL path response-byte equivalence test |
+| `tools/pulse.sh` | write-pulse checks: `pulse_edge.py` (pipelining, closes, bursts) and acknowledged-vs-stored accounting under five settings, driven by `loadgen.c` |
 | `src/routes.lisp` | routing, auth-then-id order, validation |
 | `src/server.lisp` | io_uring loop and the executable's toplevel |
 
@@ -69,8 +74,9 @@ it is a measuring aid, not an endpoint).
 - **No caching.** Every `GET` steps a prepared statement against SQLite while the request is served;
   `like_count` is computed per request. Every request verifies the token's HS256 signature and `exp`.
 - **Durability.** WAL, `synchronous=NORMAL`, `cache_size=-65536`, `busy_timeout=5000`, through SQLite's
-  `unix-excl` VFS. Each write is its own transaction; the response is only sent after the statement's
-  final step (the commit) reports DONE. A failed commit answers 500, never a 201.
+  `unix-excl` VFS. Writes are group-committed (rule 6): the writes of one pulse share one transaction, and
+  none of their responses is handed to the kernel before its `COMMIT` returns. A failed commit rolls back
+  and every write of that pulse answers 500, never a 201. Checkpoints run on a second thread (M8 below).
 - **Connections.** HTTP/1.1 keep-alive, idle connections are kept for 300 s (the spec asks for at least
   65 s), `MSG_NOSIGNAL` on every send, up to 65,535 descriptors.
 - **Health.** `/health` runs `SELECT 1`; on failure it answers 503 with the degraded body.
@@ -83,13 +89,14 @@ it is a measuring aid, not an endpoint).
   Ubuntu 6.8.0-136+ buffer-ring `resv` bug. Only 6.8 features are used.
 - **Group commit.** The first write of a pass opens a transaction; one `COMMIT` ends the pass, and write
   responses are sent only after it returns. A failed commit rolls back and every write of that pass gets a 500.
+  (Since M8 writes commit once per pulse instead of once per pass; see "The write pulse" below.)
 - **Queue scheduling**, using only the server's own queue and timings: drain first (completions are copied into a
   per-connection pending buffer and the kernel buffer is returned at once), answer oldest first (a FIFO stamped
   with the read time), and an adaptive answer cap per pass derived from the measured turn time. The caps and the
   wait are named parameters in `src/tune.lisp`.
-- **Idle-priority helper thread** in C (invisible to SBCL's GC): `SCHED_IDLE` (nice 19 if refused; the applied
-  policy is logged after reading it back), PASSIVE WAL checkpoints on its own connection, `/proc/meminfo` every
-  200 ms, stats logging.
+- **Low-priority helper thread** in C (invisible to SBCL's GC): PASSIVE WAL checkpoints on its own connection,
+  `/proc/meminfo` every 200 ms, stats logging. (Until M8 it ran at `SCHED_IDLE` and its checkpoints did
+  nothing: see "The write pulse" below. It now runs at nice 19 and does all the checkpointing.)
 - **Zero consing on the hot path.** Buffers and arenas are foreign memory addressed by fixnums (a SAP held in a
   variable is heap-allocated); `(speed 3) (safety 0)`, no efficiency notes in the build log. Measured: 0 bytes
   per call for parse+handle of `/feed`, `/posts/:id` and `/health`, and 0 bytes consed over 313,068 requests
@@ -438,3 +445,134 @@ showed, so the controller found nothing better than the base policy and says so.
 Shipped: the VOP; the 125-point parameterised policy with 27 precompiled loops; live COMPILE for the outer points (12-13 ms,
 no GC); the controller. Not shipped as a win: the controller does not beat the base at 200k (tie within 0.5 %) and does not
 rescue 260k. The wait policy is flat near the base at this load, which is the honest result.
+
+## The write pulse, and checkpoints off the event loop (M8)
+
+### What was wrong
+
+The scored run held 247,000 users at 79 % CPU with p95 251 ms, while entries with the same CPU per request
+(30 us) hold 300,000 at 92-96 %. The loop was not out of CPU: it was freezing.
+
+- The helper thread's connection never read the database, so it never opened the WAL, and
+  `sqlite3_wal_checkpoint_v2` on such a connection returns OK without doing anything. `STATS=1` showed
+  `ckpts=0` for whole runs. The thread had never checkpointed.
+- So the log grew to the `wal_autocheckpoint=32768` limit, and SQLite ran the checkpoint inside the `COMMIT`
+  that crossed it, on the event loop: the whole log copied back and two `fdatasync`s, with every connection
+  waiting. `strace -f` on the old build: every `fdatasync` is on the loop's thread, the longest 238 ms.
+
+### What changed
+
+1. **Checkpoints run on the helper thread** (`csrc/shim.c`). Automatic checkpoints are off; a WAL hook counts
+   frames. Past 4,096 frames the loop asks the thread for a PASSIVE checkpoint. The log only restarts once it
+   is copied completely, and a checkpoint cannot catch the frames written while it ran, so the loop then holds
+   its write pulse (reads go on, at most 250 ms) while the thread copies the tail. The loop then ends its read
+   transaction, the next one starts on a fully copied log, and the next write restarts the log. Past 65,536
+   frames the loop checkpoints by itself, as a last resort. The thread reads the schema once at startup, so
+   its checkpoints are real, and runs at nice 19 (a `SCHED_IDLE` thread gets nothing while the loop is busy).
+   "Fully copied" is only believed when the loop has not committed since the checkpoint was asked for
+   (SQLite reports it against the log as it was when the checkpoint began).
+2. **The write pulse** (`src/server.lisp`). A connection whose next request is a POST moves to a write queue.
+   At most once per 20 ms, and never during a hold, a pass executes the queued writes after its reads, in one
+   transaction with one `COMMIT`; the responses are sent after it returns (rule 6). With nothing queued and the
+   pulse due, a write is executed in the pass that reads it. Reads never wait for a pulse, and reads of a pass
+   are answered before its writes run, so no read sees a row that is not committed yet.
+3. **One read transaction between pulses.** A pass that only read no longer does `BEGIN`, opens four cursors,
+   closes them and `COMMIT`s: the transaction and the cursors stay open for the next pass. The loop is the only
+   writer and a pass that writes commits, so the snapshot is always the latest commit; every request still
+   reads its rows from SQLite while it is served (rule 5).
+4. Each ring's descriptor table is sized to the hard `RLIMIT_NOFILE` (65,535 on the benchmark box, unchanged)
+   instead of failing to start where the limit is lower.
+
+Not changed: the wait policy and its controller, the B-tree readers, the HTTP/JWT/JSON code. The controller's
+queue-wait signal now covers the read queue only (a write waits for its pulse by design).
+
+### Measured (2026-11-20)
+
+**Where:** a 2-vCPU cloud VM (kernel 6.18), loopback, the server pinned to one CPU and the load generator
+(`tools/loadgen.c`, the k6 user loop with shorter think times, 15 % likes, 2 % posts) to the other. SBCL 2.6.10
+and SQLite 3.54.1 built from the projects' release tags. **Not** the score-mode VM, not 200k+ connections:
+the ceiling on the benchmark box is not measured by any of this. "Old" is the previous commit plus item 4.
+
+Traced runs (`strace -f -e fdatasync`), 2,000 connections, about 20,400 req/s and 1,600 writes/s, 40 s:
+
+| | old | M8 |
+| --- | --- | --- |
+| `fdatasync` calls on the loop thread, longest | 11, 238 ms | 21, 0.8 ms (the WAL header sync of a log restart) |
+| `fdatasync` calls on the helper thread | 0 | 61 |
+| checkpoints by the helper / by the loop | 0 / every 32,768 frames | 36 / 0 |
+| worst read latency in a second | 521, 288, 230 ms (one freeze per ~11 s) | 51 ms |
+| reads p99.9 / max | 507 / 521 ms | 27 / 51 ms |
+| WAL file at the end | 135 MB | 20 MB |
+
+Untraced, alternating runs, 30 s holds, same load (us/req = process CPU, both threads, per request):
+
+| pair | us/req old | us/req M8 | reads p99.9 old / M8 | reads max old / M8 | writes p50 / p99 / max, old | writes p50 / p99 / max, M8 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 12.03 | 11.55 | 144 / 7.1 ms | 157 / 21 ms | 1.4 / 3.5 / 156 ms | 12.0 / 22.5 / 33 ms |
+| 2 | 12.53 | 11.01 | 156 / 4.4 ms | 177 / 7 ms | 1.4 / 3.4 / 177 ms | 12.0 / 22.3 / 28 ms |
+| 3 | 12.25 | 11.61 | 131 / 5.7 ms | 151 / 43 ms | 1.4 / 2.9 / 151 ms | 12.0 / 22.4 / 45 ms |
+
+All three pairs are lower on CPU (4 %, 12 %, 5 %). The CPU gain is small; the change is the tail. A write now
+waits about 12 ms for its pulse (median), which is the price.
+
+One pair at 6,000 connections, about 76,000 req/s (the server at 76 % of its CPU): old p99 143.5 ms with a
+~150 ms freeze every 3-4 s; M8 reads p99 18.6 / p99.9 35.6 / max 39.5 ms, writes p99 43.5 / max 72 ms,
+46 holds (longest 44 ms), no loop checkpoint; 10.14 -> 9.82 us/req.
+
+`strace -c -f`, 15 s: `pwrite64` 0.332 -> 0.240 per request (the M8 figure includes the checkpoint thread's
+database writes; the old build did none in that window), `io_uring_enter` 0.027 -> 0.035.
+
+The checks (tests, equivalence, fuzz, kill -9, accounting) are listed once, for the final code, at the end
+of the M9 section.
+
+At the server's limit (9,000 connections, the closed loop holds the load at what the server can answer),
+order old, new, new, old, 30 s holds, the new build with `WALBUF=1 INLINE=1`:
+
+| | req/s | us/req | reads p50 / p95 / p99 |
+| --- | --- | --- | --- |
+| old, run 1 / run 2 | 70,012 / 70,004 | 11.18 / 11.73 | 47.5 / 90.7 / 212.8 and 50.1 / 86.6 / 228.5 ms |
+| new, run 1 / run 2 | 85,296 / 88,443 | 9.23 / 9.44 | 28.5 / 55.1 / 72.7 and 22.4 / 53.8 / 71.7 ms |
+
+The same test a few minutes later with the switches off (the default build; not interleaved with the old one):
+86,211 and 84,019 req/s, 9.60 and 9.47 us/req, reads p99 71.6 and 73.1 ms. So the gain at the limit, about a
+fifth more requests with a third of the p99, comes from the pulse and the checkpoint thread, not from M9.
+
+### Not done
+
+- Not run on the score-mode VM or at 200k+ users. Whether the ceiling moves, and by how much, needs that run.
+- The test rig's CPU figures move about 10 % between identical runs, so effects under a few percent cannot
+  be seen on it. The rig that made the earlier sections resolves 0.5 %.
+
+## Four switches, built and left off (M9)
+
+Each was built, passes every check below with the switch on, and showed no gain that the test rig could
+measure. By this README's own bar (both pairs lower, or it does not ship as a win) they are off by default.
+They are worth one A/B each on the rig, which resolves much smaller differences.
+
+| switch | what it does | measured here (same rig as M8) |
+| --- | --- | --- |
+| `WALBUF=1` | One write per commit: a VFS over `unix-excl` (public VFS interface) buffers a commit's WAL frames and writes them when the commit frame's page arrives, inside SQLite's own `xWrite`, so the commit is in the kernel before it is published and before `COMMIT` returns. Any other write, and every read, sync, truncate and close of the WAL, writes the buffer first | `pwrite64` 0.240 -> 0.027 per request. CPU: six order-balanced pairs at 21k req/s, mean 14.37 us/req off, 14.68 on, single runs from 12.8 to 17.0: no difference visible |
+| `INLINE=1` | A chunk that is exactly one complete read request, on an idle connection with nothing older queued anywhere, is answered from the kernel's receive buffer: no malloc, copy, FIFO entry or free. Everything else (POSTs, split or pipelined requests, a backlog) takes the old path, so order is unchanged | 92 % of requests take it. CPU: three rounds, 13.13 us/req off, 13.65 on: within the noise |
+| `PULSE_MAX_MS=n` | The breathing pulse: while reads are still queued after a pass's share, the write pulse stretches, until the oldest queued write has waited n ms | The CPU curve over a fixed pulse is nearly flat past 20 ms (0 ms 14.5 and 14.5, 5 ms 14.2, 10 ms 12.8, 20 ms 13.7 and 14.0, 50 ms 13.7, 100 ms 13.3, 200 ms 12.9 us/req, with write p50 rising to 112 ms), so there is little for a stretch to win. In the freeze tests it triggered 0 to 3 times a run and changed nothing |
+| `QUEUE=newest` | Past one pass of read backlog, three of four answers go to the newest request and one to the oldest | Freeze tests (the whole server stopped for 200 or 600 ms every 5 s at 63-70k req/s): reads p99 207 vs 206 ms and 610 vs 609 ms. The backlog drains in about five passes whatever the order, so the order does not matter |
+
+At the server's limit (the table above, same settings, two runs each): no switch 86,211 / 84,019 req/s,
+`WALBUF` 87,045 / 83,054, `INLINE` 95,742 / 87,530, both 84,105 / 80,052. All inside the run-to-run spread.
+
+What was not built: the M7 controller was not pointed at the pulse. The pulse width is one variable read at
+run time, so changing it needs no recompiled loop, and the flat curve above says a controller would have
+nothing to find.
+
+**Checks on the final code, each with the four switches off and on:** `test/run.sh` 42/42 and 42/42;
+`tools/equiv.sh` 2,208 compared, 0 mismatches, twice; `tools/fuzz.sh` 20,947 cases, 0 5xx, the status counts
+above, same pid, 42/42 afterwards, twice; `tools/pulse.sh` (27 edge checks and exact accounting under five
+settings) OK twice; `tools/kill9.py` four runs (690, 465, 841 and 465 acknowledged posts, two with the
+switches on, two with `CKPT_FRAMES=64`), 0 missing, `integrity_check` ok. 0 GCs in every run of this
+session (283 stats lines). The build log has the same 244 notes and 6 style warnings as before M8.
+
+Ideas from other entries, no code copied: the checkpoint thread with a short write hold so the log can restart
+is [rust-iouring-kensac](../rust-iouring-kensac)'s policy; committing writes on a window while a read
+transaction carries over between passes is [fsharp-uring-delneg](../fsharp-uring-delneg)'s and
+[rust-iouring-rkkautsar](../rust-iouring-rkkautsar)'s; one write per commit through a VFS is
+[c-iouring-pavlyhalim](../c-iouring-pavlyhalim)'s and delneg's; answering from the receive buffer is how
+kensac and delneg read; newest-first under backlog is delneg's.

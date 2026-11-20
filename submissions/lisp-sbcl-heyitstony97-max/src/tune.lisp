@@ -34,6 +34,20 @@
 (defconstant +clock-every+ 32)          ; requests between clock reads inside the answer phase
 (defconstant +fifo-log2+ 20)            ; connections waiting for an answer: 2^20 entries
 
+;;; ---- the write pulse (M8) ------------------------------------------------------------------
+;;; Reads are answered in the pass that receives them. Writes (every POST) wait in a queue of their
+;;; own and are executed together, in one transaction with one COMMIT, at most once per pulse; their
+;;; responses are sent after that COMMIT returns (rule 6). Between pulses the loop keeps one read
+;;; transaction and its cursors open instead of BEGIN/COMMIT in every pass.
+(defconstant +pulse-ms-default+ 20)     ; least time between two write commits (PULSE_MS overrides; 0: every pass)
+(defconstant +write-cap+ 1024)          ; writes executed in one pulse; the rest go first in the next pass
+(defconstant +wq-log2+ 20)              ; connections waiting for a pulse: 2^20 entries
+;;; Built, switchable, and OFF by default because they measured no gain on the test rig (README, M9):
+;;;   WALBUF=1          one write per commit (a VFS that buffers a commit's WAL frames; csrc/shim.c)
+;;;   INLINE=1          a complete read request on an idle connection is answered from the kernel's buffer, no copy
+;;;   PULSE_MAX_MS=n    the breathing pulse: while reads are backed up the pulse stretches, up to n ms
+;;;   QUEUE=newest      past one pass of read backlog, three of four answers go to the newest request
+
 ;;; ---- response arenas ---------------------------------------------------------------------
 ;;; A response is built in place in an arena; the arena stays pinned until every send from it is
 ;;; done. Several arenas, so a slow client never stalls the next pass.

@@ -173,12 +173,16 @@
 (defconstant +sqlite-row+ 100)
 (defconstant +sqlite-done+ 101)
 
-;;; ---- the idle-priority helper thread (csrc/shim.c) ----------------------------------------
+;;; ---- the low-priority helper thread (csrc/shim.c) -----------------------------------------
 ;;; Pure C: it never touches the Lisp heap, so a GC never has to stop it.
 (defalien %td-start-helper "td_start_helper" sb-alien:int
   (path sb-alien:c-string) (stats-on sb-alien:int))
 (defalien %td-stats-addr "td_stats_addr" sb-alien:unsigned-long)
 (defalien %td-policy "td_helper_policy" sb-alien:int)
+;;; Once per pass: drives the checkpoint thread. Bit 0: writes are held; bit 1: end the read
+;;; transaction (the log is fully copied); bit 2: last resort, end it and call %td-force-ckpt.
+(defalien %td-tick "td_tick" sb-alien:int)
+(defalien %td-force-ckpt "td_force_ckpt" sb-alien:int)
 
 ;;; ---- B-tree cursor reads (csrc/shim.c, PR #153) ----------------------------------------------
 (defalien %td-bt-init "td_bt_init" sb-alien:int (err sb-alien:unsigned-long) (n sb-alien:int))

@@ -12,10 +12,16 @@
 ;;;;      kernel's socket memory is freed even when answers lag;
 ;;;;   3. ANSWER OLDEST FIRST: connections with unanswered bytes wait in a FIFO stamped with the time
 ;;;;      they were read; pop in that order, at most the adaptive cap per pass, and stop early when
-;;;;      the pass has run past the turn target;
-;;;;   4. GROUP COMMIT: all writes of the pass share one transaction; the sends are queued only
-;;;;      after COMMIT returns (a failed commit rolls back and every write gets a 500).
-;;;; The queue policies read only server state and timings (tune.lisp), never route or client.
+;;;;      the pass has run past the turn target. Reads are answered here, inside one read
+;;;;      transaction that stays open from pass to pass;
+;;;;   4. THE WRITE PULSE (M8): a connection whose next request is a POST moves to a queue of its
+;;;;      own. At most once per pulse (20 ms), and never while the checkpoint thread holds writes,
+;;;;      the pass executes the queued writes after its reads, in one transaction;
+;;;;   5. GROUP COMMIT: a pass that wrote commits once; the sends are queued only after COMMIT
+;;;;      returns (a failed commit rolls back and every write gets a 500);
+;;;;   6. the checkpoint tick (csrc/shim.c): the loop never checkpoints or syncs by itself.
+;;;; The queue policies read only server state and timings (tune.lisp): a request's method decides
+;;;; which queue it waits in, nothing about the client or the load does.
 (in-package #:feed)
 
 (declaim (optimize (speed 1) (safety 1) (debug 0)))
@@ -71,6 +77,7 @@
 (defconstant +cf-close+ 2)         ; close after the current send / answer
 (defconstant +cf-cont+ 4)          ; 100-continue already sent for the current request
 (defconstant +cf-fifo+ 8)          ; has an entry in the FIFO
+(defconstant +cf-held+ 16)         ; has an entry in the write queue (its next request is a POST)
 
 ;;; response-list entry flags
 (defconstant +ef-write+ 1)
@@ -121,6 +128,32 @@
 (sb-ext:defglobal **ctl-ru** 0)
 (sb-ext:defglobal **started-mono** 0)
 (sb-ext:defglobal **gc-last** 0)
+(sb-ext:defglobal **wq** 0)                ; write queue: connections whose next request is a POST
+(sb-ext:defglobal **wq-head** 0)
+(sb-ext:defglobal **wq-tail** 0)
+(sb-ext:defglobal **pulse-ns** (* +pulse-ms-default+ 1000000))
+(sb-ext:defglobal **last-commit-ns** 0)    ; when the last write pulse committed
+(sb-ext:defglobal **writes-held** nil)     ; the checkpoint thread is copying the log's tail
+(sb-ext:defglobal **writes-ok** nil)       ; the pass is in its write phase
+(sb-ext:defglobal **rcount-reads** 0)      ; response-list entries queued before the write phase
+(sb-ext:defglobal **npulse** 0)
+(sb-ext:defglobal **nheld** 0)
+(sb-ext:defglobal **inline-on** nil)       ; INLINE=1: answer from the kernel's receive buffer when possible
+(sb-ext:defglobal **inline-left** 0)       ; answers the reap may still give in this pass
+(sb-ext:defglobal **inline-n** 0)          ; ...and how many it gave
+(sb-ext:defglobal **ninline** 0)
+(sb-ext:defglobal **pass-t0** 0)           ; when the pass began (ns)
+(sb-ext:defglobal **pulse-max-ns** (* +pulse-ms-default+ 1000000)) ; longest a pulse may stretch (PULSE_MAX_MS)
+(sb-ext:defglobal **breathe** nil)         ; the pulse stretches while reads are backed up (PULSE_MAX_MS > PULSE_MS)
+(sb-ext:defglobal **wq-oldest-ns** 0)      ; when the write queue last became non-empty
+(sb-ext:defglobal **nstretch** 0)
+(sb-ext:defglobal **newest-first** nil)    ; QUEUE=newest: past one pass of backlog, newest reads go first
+(sb-ext:defglobal **nlifo** 0)
+(declaim (type addr **wq**)
+         (type fixnum **wq-head** **wq-tail** **pulse-ns** **last-commit-ns** **rcount-reads** **npulse** **nheld**
+               **inline-left** **inline-n** **ninline** **pass-t0**
+               **pulse-max-ns** **wq-oldest-ns** **nstretch** **nlifo**))
+(sb-ext:defglobal **max-slots** +max-slots+)   ; descriptor-table slots per ring: min(+max-slots+, hard RLIMIT_NOFILE)
 (declaim (type simple-vector **variants**)
          (type (simple-array fixnum (48)) **ctl**)
          (type (simple-array fixnum (125)) **ctl-bad**)
@@ -247,8 +280,8 @@ all zeroes and accepts a nonzero resv[0]); a refused registration is tried once 
         (dotimes (i sq-n) (setf (a-ref-32 (+ sqm sq-array) (* 4 i)) i))
         ;; sparse direct-descriptor table
         (let ((tab (zeroed-alloc (* 4 +max-slots+))))
-          (dotimes (i +max-slots+) (setf (a-ref-32 tab (* 4 i)) #xffffffff))
-          (let ((rc (%syscall6 +sys-io-uring-register+ fd 2 tab +max-slots+ 0 0)))
+          (dotimes (i **max-slots**) (setf (a-ref-32 tab (* 4 i)) #xffffffff))
+          (let ((rc (%syscall6 +sys-io-uring-register+ fd 2 tab **max-slots** 0 0)))
             (%mmap-free tab (* 4 +max-slots+))
             (when (< rc 0)
               (log-line "registering the descriptor table failed, errno ~D" (sb-alien:get-errno))
@@ -401,7 +434,7 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
 (declaim (inline maybe-enqueue))
 (defun maybe-enqueue (ri slot c)
   (declare (type (unsigned-byte 8) ri) (type (unsigned-byte 16) slot) (type addr c))
-  (unless (flag-p c (logior +cf-busy+ +cf-fifo+))
+  (unless (flag-p c (logior +cf-busy+ +cf-fifo+ +cf-held+))
     (flag-on c +cf-fifo+)
     (setf (c-rts c) **now-ns**)
     (setf (a-ref-32 **fifo** (* 4 (logand **fifo-tail** (1- (ash 1 +fifo-log2+)))))
@@ -480,7 +513,7 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
          (declare (type (unsigned-byte 16) slot gen))
          (setf (c-gen c) gen
                (c-state c) 1
-               (c-flags c) (logand (c-flags c) +cf-fifo+)   ; a stale FIFO entry may still exist
+               (c-flags c) (logand (c-flags c) (logior +cf-fifo+ +cf-held+)) ; a stale queue entry may still exist
                (c-plen c) 0 (c-pptr c) 0 (c-pcap c) 0
                (c-last c) **mono-s**)
          (incf (rf r +f-open+))
@@ -507,9 +540,22 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
        (let ((bid (ash fl -16)))
          (declare (type (unsigned-byte 16) bid))
          (when live
-           (if (append-pending c (+ (rf r +f-bufs+) (* bid +buf-size+)) res)
-               (setf (c-last c) **mono-s**)
-               (conn-close ri r slot c)))
+           (let* ((src (+ (rf r +f-bufs+) (* bid +buf-size+)))
+                  ;; an idle connection, nothing older waiting anywhere, answers left in this pass:
+                  ;; try to answer straight from the kernel's buffer (1 answered, 2 a complete POST, 0 no)
+                  (how (if (and (plusp **inline-left**) (zerop (c-plen c))
+                                (zerop (logand (c-flags c) (logior +cf-busy+ +cf-fifo+ +cf-held+ +cf-close+)))
+                                (= **fifo-head** **fifo-tail**))
+                           (answer-inline ri slot c src res)
+                           0)))
+             (declare (type addr src) (type fixnum how))
+             (cond ((= how 1) (setf (c-last c) **mono-s**))
+                   ((append-pending c src res)
+                    (setf (c-last c) **mono-s**)
+                    (when (= how 2)              ; a write: straight to the write queue, parsed again at its pulse
+                      (setf (c-rts c) **now-ns**)
+                      (hold-to-wq ri slot c)))
+                   (t (conn-close ri r slot c)))))
          (buf-return r bid)
          (when (and live (= (c-state c) 1))
            (maybe-enqueue ri slot c)
@@ -517,7 +563,7 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
       (live
        (cond ((= res 0)                                    ; EOF: answer what is pending, then close
               (flag-on c +cf-close+)
-              (unless (flag-p c (logior +cf-busy+ +cf-fifo+))
+              (unless (flag-p c (logior +cf-busy+ +cf-fifo+ +cf-held+))
                 (if (plusp (c-plen c))
                     (maybe-enqueue ri slot c)
                     (conn-close ri r slot c))))
@@ -619,8 +665,21 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
              (setf (c-plen c) left)))
     nil))
 
+(declaim (inline hold-conn))
+(defun hold-conn (ri slot c)
+  "Connection C's next request is a write: it waits, unparsed, in the write queue for the pulse."
+  (declare (type (unsigned-byte 8) ri) (type (unsigned-byte 16) slot) (type addr c))
+  (flag-on c +cf-held+)
+  (when (= **wq-head** **wq-tail**) (setf **wq-oldest-ns** **now-ns**))
+  (setf (a-ref-32 **wq** (* 4 (logand **wq-tail** (1- (ash 1 +wq-log2+)))))
+        (logior (ash ri 16) slot))
+  (incf **wq-tail**)
+  (incf **nheld**)
+  nil)
+
 (defun answer-conn (ri slot c)
-  "Parse and answer one request of connection C. Returns 1 when a response was queued."
+  "Parse and answer one request of connection C. Returns 1 when a response was queued. Outside the
+write phase a POST is not answered: its connection moves to the write queue (returns 0)."
   (declare (type (unsigned-byte 8) ri) (type (unsigned-byte 16) slot) (type addr c))
   (let* ((buf (c-pptr c)) (len (c-plen c))
          (w (+ (arena-base **arena-cur**) **arena-pos**))
@@ -631,6 +690,9 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
     (let ((total (parse-request buf len)))
       (declare (type fixnum total))
       (cond
+        ((and (> total 0) (= **req-method** 1) (not **writes-ok**))
+         (hold-conn ri slot c)
+         0)
         ((> total 0)
          (let ((closep **req-close**))
            (incf **nreq**)
@@ -659,35 +721,121 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
            (push-entry id (fixed-addr idx) (fixed-len idx) 0 255 rts)
            1))))))
 
-(defun answer-phase (t0)
-  "Oldest first. Returns the number of requests answered."
-  (declare (type (unsigned-byte 62) t0))
-  (let ((n 0) (cap **cap**) (limit (* +turn-hi-us+ 1000)))
-    (declare (type fixnum n cap limit))
-    ;; every send from the current arena is done: start over at its front, where the cache is warm
-    (when (zerop (arena-out **arena-cur**)) (setf **arena-pos** 0))
+(defun write-phase ()
+  "The pulse: answer the connections waiting in the write queue, oldest first, with writes allowed.
+Everything executed here shares the pass's one COMMIT. Returns the number of requests answered."
+  (let ((n 0))
+    (declare (type fixnum n))
+    (setf **writes-ok** t)
     (loop
-      (when (or (>= n cap) (= **fifo-head** **fifo-tail**)) (return))
-      (when (and (zerop (logand n (1- +clock-every+))) (plusp n)
-                 (> (- (now-ns) t0) limit))
-        (return))
+      (when (or (>= n +write-cap+) (= **wq-head** **wq-tail**)) (return))
       (unless (arena-room) (return))
-      (let* ((id (a-ref-32 **fifo** (* 4 (logand **fifo-head** (1- (ash 1 +fifo-log2+))))))
+      (let* ((id (a-ref-32 **wq** (* 4 (logand **wq-head** (1- (ash 1 +wq-log2+))))))
              (ri (ash id -16)) (slot (logand id #xffff))
              (r (ring-at ri)) (c (conn-at r slot)))
         (declare (type (unsigned-byte 32) id) (type (unsigned-byte 8) ri) (type (unsigned-byte 16) slot)
                  (type addr r c))
-        (incf **fifo-head**)
-        (flag-off c +cf-fifo+)
+        (incf **wq-head**)
+        (flag-off c +cf-held+)
         (when (and (= (c-state c) 1) (not (flag-p c +cf-busy+)) (plusp (c-plen c)))
           (incf n (the fixnum (answer-conn ri slot c))))))
+    (setf **writes-ok** nil)
+    n))
+
+(defun hold-to-wq (ri slot c)
+  "HOLD-CONN for callers earlier in the file (the receive path)."
+  (declare (type (unsigned-byte 8) ri) (type (unsigned-byte 16) slot) (type addr c))
+  (hold-conn ri slot c))
+
+(defun answer-inline (ri slot c src len)
+  "The chunk of LEN bytes at SRC (the kernel's receive buffer) was just received on an idle connection
+and nothing older waits anywhere. When it is exactly one complete request that is not a write, answer it
+from where it lies, with no copy (returns 1). A complete POST returns 2 and anything else 0: the caller
+keeps the bytes on the connection, as before."
+  (declare (type (unsigned-byte 8) ri) (type (unsigned-byte 16) slot) (type addr c src)
+           (type (unsigned-byte 32) len))
+  ;; every send from the current arena is done: start over at its front, where the cache is warm
+  (when (zerop (arena-out **arena-cur**)) (setf **arena-pos** 0))
+  (unless (arena-room) (return-from answer-inline 0))
+  (let ((w (+ (arena-base **arena-cur**) **arena-pos**)))
+    (declare (type addr w))
+    (setf **w** w)
+    (let ((total (parse-request src len)))
+      (declare (type fixnum total))
+      (cond
+        ((/= total len) 0)
+        ((= **req-method** 1) 2)
+        (t
+         (let ((closep **req-close**) (id (logior (ash ri 16) slot)))
+           (declare (type (unsigned-byte 32) id))
+           (incf **nreq**)
+           (setf **wrote** nil **wp** +hdr-room+)
+           (handle-request src)
+           (let ((oa **out-addr**) (ol **out-len**))
+             (declare (type addr oa) (type (unsigned-byte 32) ol))
+             (cond ((and (>= oa w) (< oa (+ w +arena-bytes+)))
+                    (setf **arena-pos** (logand (+ (- (+ oa ol) (arena-base **arena-cur**)) 15) (lognot 15)))
+                    (incf (arena-out **arena-cur**))
+                    (push-entry id oa ol 0 **arena-cur** (the (unsigned-byte 62) **now-ns**)))
+                   (t (push-entry id oa ol 0 255 (the (unsigned-byte 62) **now-ns**)))))
+           (flag-on c (if closep (logior +cf-busy+ +cf-close+) +cf-busy+))
+           (decf **inline-left**)
+           (incf **inline-n**)
+           ;; the pass's time limit holds here as well
+           (when (and (zerop (logand **inline-n** (1- +clock-every+)))
+                      (> (- (the fixnum (now-ns)) **pass-t0**) (* +turn-hi-us+ 1000)))
+             (setf **inline-left** 0))
+           1))))))
+
+(defun answer-phase (t0)
+  "Reads oldest first, then (when the pulse is due and writes are not held) the queued writes.
+Returns the number of requests answered."
+  (declare (type (unsigned-byte 62) t0))
+  (let ((n **inline-n**) (cap **cap**) (limit (* +turn-hi-us+ 1000)))   ; the reap's answers count
+    (declare (type fixnum n cap limit))
+    ;; every send from the current arena is done: start over at its front, where the cache is warm
+    (when (zerop (arena-out **arena-cur**)) (setf **arena-pos** 0))
+    (setf **writes-ok** nil)
+    ;; QUEUE=newest: with more than one pass of reads queued, three of four answers go to the newest
+    ;; request and one to the oldest (a connection has one entry at most, so its own order is kept)
+    (let ((lifo (and **newest-first** (> (- **fifo-tail** **fifo-head**) cap))) (k 0))
+      (declare (type fixnum k))
+      (when lifo (incf **nlifo**))
+      (loop
+        (when (or (>= n cap) (= **fifo-head** **fifo-tail**)) (return))
+        (when (and (zerop (logand n (1- +clock-every+))) (plusp n)
+                   (> (- (now-ns) t0) limit))
+          (return))
+        (unless (arena-room) (return))
+        (let* ((idx (cond ((and lifo (/= (logand k 3) 3)) (decf **fifo-tail**) **fifo-tail**)
+                          (t (prog1 **fifo-head** (incf **fifo-head**)))))
+               (id (a-ref-32 **fifo** (* 4 (logand idx (1- (ash 1 +fifo-log2+))))))
+               (ri (ash id -16)) (slot (logand id #xffff))
+               (r (ring-at ri)) (c (conn-at r slot)))
+          (declare (type fixnum idx) (type (unsigned-byte 32) id) (type (unsigned-byte 8) ri)
+                   (type (unsigned-byte 16) slot) (type addr r c))
+          (incf k)
+          (flag-off c +cf-fifo+)
+          (when (and (= (c-state c) 1) (not (flag-p c +cf-busy+)) (plusp (c-plen c)))
+            (incf n (the fixnum (answer-conn ri slot c)))))))
+    (setf **rcount-reads** **rcount**)
+    (when (and (/= **wq-head** **wq-tail**) (not **writes-held**)
+               (>= (- (the fixnum t0) **last-commit-ns**) **pulse-ns**)
+               ;; breathing (PULSE_MAX_MS): while reads are still queued after this pass's share, the
+               ;; pulse stretches, until the oldest queued write has waited the longest allowed
+               (or (not **breathe**)
+                   (= **fifo-head** **fifo-tail**)
+                   (>= (- (the fixnum t0) **wq-oldest-ns**) **pulse-max-ns**)
+                   (progn (incf **nstretch**) nil)))
+      (incf n (the fixnum (write-phase))))
     n))
 
 (defun finish-phase ()
-  "Group commit, then queue the sends. Returns the number of sends."
-  (let ((count **rcount**))
-    (declare (type fixnum count))
-    (when **in-txn**
+  "Group commit when the pass wrote (a pass that only read keeps its read transaction for the next
+one), then queue the sends. Returns the number of sends."
+  (let ((count **rcount**) (reads **rcount-reads**))
+    (declare (type fixnum count reads))
+    (when **txn-dirty**
       (unless (db-commit)
         (db-rollback)
         (dotimes (i count)
@@ -695,7 +843,11 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
             (declare (type addr e))
             (when (logtest (a-ref-8 e 16) +ef-write+)
               (setf (a-ref-64 e 8) (fixed-addr +r-internal+)
-                    (a-ref-32 e 4) (fixed-len +r-internal+)))))))
+                    (a-ref-32 e 4) (fixed-len +r-internal+))))))
+      (incf **npulse**)
+      ;; the next pulse is one period after this commit; with writes still queued (more than one
+      ;; pulse's cap) the next pass goes on with them at once
+      (when (= **wq-head** **wq-tail**) (setf **last-commit-ns** (the fixnum (now-ns)))))
     (let ((now (now-ns)) (wmax **wait-max-pass**))
       (declare (type (unsigned-byte 62) now) (type fixnum wmax))
       (dotimes (i count)
@@ -705,9 +857,11 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
                (addr (a-ref-64 e 8)) (len (a-ref-32 e 4)))
           (declare (type addr e r c addr) (type (unsigned-byte 32) id len) (type (unsigned-byte 8) ri)
                    (type (unsigned-byte 16) slot))
-          (let ((wait (- now (the (unsigned-byte 62) (a-ref-64 e 24)))))
-            (declare (type fixnum wait))
-            (when (> wait wmax) (setf wmax wait)))
+          ;; the queue-wait signal covers the read queue only: a write waits for its pulse by design
+          (when (< i reads)
+            (let ((wait (- now (the (unsigned-byte 62) (a-ref-64 e 24)))))
+              (declare (type fixnum wait))
+              (when (> wait wmax) (setf wmax wait))))
           (setf (c-saddr c) addr (c-sleft c) len)
           (submit-send ri r slot (c-gen c) (a-ref-8 e 17) addr len)))
       (setf **wait-max-pass** wmax))
@@ -730,7 +884,7 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
       (when (< ri **nrings**)
         (let* ((r (ring-at ri)) (c (conn-at r slot)))
           (declare (type addr r c))
-          (when (and (= (c-state c) 1) (not (flag-p c (logior +cf-busy+ +cf-fifo+)))
+          (when (and (= (c-state c) 1) (not (flag-p c (logior +cf-busy+ +cf-fifo+ +cf-held+)))
                      (> (- **mono-s** (c-last c)) limit))
             (conn-close ri r slot c))))
       (incf slot)
@@ -781,7 +935,12 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
           (a-ref-64 st 40) **gcs**
           (a-ref-64 st 48) npass
           (a-ref-64 st 56) **turn-max-all**
-          (a-ref-64 st 64) **wait-max-all**)
+          (a-ref-64 st 64) **wait-max-all**
+          (a-ref-64 st 96) **npulse**
+          (a-ref-64 st 104) **nheld**
+          (a-ref-64 st 160) (incf **ninline** **inline-n**)
+          (a-ref-64 st 168) **nstretch**
+          (a-ref-64 st 176) **nlifo**)
     (let ((open 0))
       (declare (type fixnum open))
       (dotimes (ri **nrings**) (incf open (the fixnum (rf (ring-at ri) +f-open+))))
@@ -810,12 +969,17 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
                (if (or (>= last-cqes +busy-cqes+) (>= open ,batch-open))
                    ;; many connections: collect completions for up to the wait in one enter
                    (ring-enter r0 ,wait-min ,wait-ns)
+                   ;; writes waiting for their pulse: never the long idle wait
                    (ring-enter r0 +wait-min-low+
-                               (if (and (= **nrings** 1) (zerop last-cqes)) +wait-idle-ns+ ,wait-ns))))))
+                               (if (and (= **nrings** 1) (zerop last-cqes) (= **wq-head** **wq-tail**))
+                                   +wait-idle-ns+
+                                   ,wait-ns))))))
        (let ((t0 (update-clocks)) (cq 0))
          (declare (type (unsigned-byte 62) t0) (type fixnum cq))
-         ;; 2. drain first
-         (setf **reads-left** +read-cap+)
+         ;; 2. drain first (with INLINE=1 a complete read request on an idle connection is answered where it lies)
+         (setf **reads-left** +read-cap+
+               **pass-t0** t0 **inline-n** 0
+               **inline-left** (if **inline-on** **cap** 0))
          (dotimes (ri **nrings**) (incf cq (the fixnum (reap-ring ri))))
          ;; 3 + 4. answer oldest first, commit once, queue the sends
          (let ((n (answer-phase t0)))
@@ -826,6 +990,14 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
              (when (plusp n) (adapt-cap n elapsed))
              (incf npass)
              (publish-stats (floor elapsed 1000) npass)))
+         ;; the checkpoint thread: hold or release the write pulse; end the read transaction when
+         ;; the log is fully copied, so the next write restarts it
+         (let ((f (%td-tick)))
+           (declare (type fixnum f))
+           (setf **writes-held** (logtest f 1))
+           (when (logtest f 6)
+             (db-end-read-txn)
+             (when (logtest f 4) (%td-force-ckpt))))
          ;; housekeeping: idle connections, and accepting again after slots were freed
          (sweep-step (if (< (the fixnum (a-ref-64 **stats** 72)) +low-mem-kb+)
                          (if (zerop (the fixnum (a-ref-64 **stats** 72))) +idle-seconds+ +idle-low-mem-seconds+)
@@ -833,7 +1005,7 @@ wait for MIN completions or that long. The syscall is the raw-syscall VOP: rc is
          (when (zerop (logand npass 1023))
            (dotimes (ri **nrings**)
              (let ((r (ring-at ri)))
-               (when (and (plusp (rf r +f-full+)) (< (rf r +f-open+) (- +max-slots+ 4096)))
+               (when (and (plusp (rf r +f-full+)) (< (rf r +f-open+) (- **max-slots** (min 4096 (ash **max-slots** -2)))))
                  (setf (rf r +f-full+) 0))))
            (spill))
          (setf last-cqes cq)
@@ -1169,17 +1341,22 @@ perf can name SBCL frames. Not hot; never runs unless asked."
         **ts** (foreign-alloc 64)
         **earg** (foreign-alloc 64)
         **fifo** (zeroed-alloc (* 4 (ash 1 +fifo-log2+)))
-        **rlist** (zeroed-alloc (* 32 (+ +answer-cap-max+ 64)))
+        **wq** (zeroed-alloc (* 4 (ash 1 +wq-log2+)))
+        **rlist** (zeroed-alloc (* 32 (+ +answer-cap-max+ +write-cap+ 64)))
         **arenas** (zeroed-alloc (* +arenas+ +arena-bytes+))
         **arena-out** (zeroed-alloc (* 4 +arenas+))
         **cap** +answer-cap-init+))
 
 (defun raise-nofile ()
-  "A registered descriptor table counts against RLIMIT_NOFILE: lift the soft limit to the hard one."
+  "A registered descriptor table counts against RLIMIT_NOFILE: lift the soft limit to the hard one,
+and size each ring's table to it (65,535 on the benchmark box; smaller where the hard limit is lower,
+instead of failing to start)."
   (let ((rl (foreign-alloc 16)))
     (when (zerop (%getrlimit +rlimit-nofile+ rl))
       (setf (a-ref-64 rl 0) (a-ref-64 rl 8))
-      (%setrlimit +rlimit-nofile+ rl))
+      (%setrlimit +rlimit-nofile+ rl)
+      (let ((hard (a-ref-64 rl 8)))
+        (setf **max-slots** (max 64 (min +max-slots+ (if (> hard 65535) 65535 hard))))))
     (%free rl)))
 
 (defun serve ()
@@ -1200,7 +1377,19 @@ perf can name SBCL frames. Not hot; never runs unless asked."
     (unless (ring-setup 0) (error "cannot set up io_uring (kernel too old, or blocked by seccomp?)"))
     (setf **nrings** 1)
     (setf **stats** (%td-stats-addr))
-    (dotimes (i 16) (setf (a-ref-64 **stats** (* 8 i)) 0))
+    (dotimes (i 32) (setf (a-ref-64 **stats** (* 8 i)) 0))
+    (let ((ms (or (parse-integer (env "PULSE_MS" "") :junk-allowed t) +pulse-ms-default+)))
+      (setf **pulse-ns** (* 1000000 (max 0 (min 1000 ms))))
+      (log-line "write pulse: ~D ms" (floor **pulse-ns** 1000000)))
+    (let ((mx (parse-integer (env "PULSE_MAX_MS" "") :junk-allowed t)))
+      (setf **pulse-max-ns** (if mx (* 1000000 (max 0 (min 5000 mx))) **pulse-ns**)
+            **breathe** (> **pulse-max-ns** **pulse-ns**))
+      (when **breathe**
+        (log-line "breathing pulse: stretches to ~D ms while reads are backed up" (floor **pulse-max-ns** 1000000))))
+    (setf **newest-first** (equal (env "QUEUE") "newest"))
+    (when **newest-first** (log-line "read queue: newest first past one pass of backlog (QUEUE=newest)"))
+    (setf **inline-on** (equal (env "INLINE") "1"))
+    (when **inline-on** (log-line "answers from the kernel's receive buffer: on (INLINE=1)"))
     (%td-start-helper path (if (env "STATS") 1 0))
     (arm-all 0)
     (setf **gc-last** sb-ext:*gc-run-time*)

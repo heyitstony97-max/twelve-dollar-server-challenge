@@ -20,6 +20,7 @@
                **st-begin** **st-commit** **st-rollback**))
 
 (sb-ext:defglobal **broken** nil)       ; SQLite ended the pass's transaction itself (a failed write)
+(sb-ext:defglobal **txn-dirty** nil)    ; the open transaction has executed a write: it must COMMIT before any send
 
 (defconstant +db-ok+ 0)
 (defconstant +db-missing+ 1)
@@ -63,8 +64,12 @@
     (%free err)
     t))
 
-;;; ---- group commit: one transaction per loop pass ---------------------------------------------
-;;; The first write of a pass opens it; the loop commits once, before any write response is sent.
+;;; ---- group commit: one transaction per write pulse -------------------------------------------
+;;; The first request that touches the database opens the transaction (and the B-tree cursors). A
+;;; pass that only read leaves it open for the next pass (the loop is the only writer, so the
+;;; snapshot is always the latest commit). A pass that wrote commits once, before any of its
+;;; responses is sent; the loop also ends a read-only transaction when the checkpoint thread has
+;;; copied the whole log, so the next one starts on it and the next write restarts the log.
 
 (defun db-ensure-txn ()
   "T when a transaction is open (opening one if needed). With the B-tree path on, the first request
@@ -89,15 +94,21 @@ of a pass that touches the database, read or write, opens it and the cursors wit
   (when **bt-on** (%td-bt-close-cursors))
   (let ((rc (%step **st-commit**)) (ok (not **broken**)))
     (%reset **st-commit**)
-    (setf **in-txn** nil **broken** nil)
+    (setf **in-txn** nil **broken** nil **txn-dirty** nil)
     (and ok (= rc +sqlite-done+))))
 
 (defun db-rollback ()
   (when **bt-on** (%td-bt-close-cursors))
   (%step **st-rollback**)
   (%reset **st-rollback**)
-  (setf **in-txn** nil **broken** nil)
+  (setf **in-txn** nil **broken** nil **txn-dirty** nil)
   t)
+
+(defun db-end-read-txn ()
+  "Ends a transaction that has only read (nothing to make durable). No-op when none is open."
+  (when (and **in-txn** (not **txn-dirty**))
+    (unless (db-commit) (db-rollback)))
+  nil)
 
 (defun w-column-string (st col)
   (declare (type addr st) (type fixnum col))
@@ -183,7 +194,7 @@ cursor decoders do not recognise."
   "Returns +db-ok+ with **wp** untouched; the caller reads (db-like-new-p)."
   (declare (type fixnum user-id post-id))
   (unless (db-ensure-txn) (return-from db-like +db-error+))
-  (setf **wrote** t)
+  (setf **wrote** t **txn-dirty** t)
   (let ((st **st-insert-like**))
     (%bind-int64 st 1 user-id)
     (%bind-int64 st 2 post-id)
@@ -199,7 +210,7 @@ cursor decoders do not recognise."
 body is only kept when that last step reports DONE."
   (declare (type fixnum user-id n) (type addr body))
   (unless (db-ensure-txn) (return-from db-insert-post +db-error+))
-  (setf **wrote** t)
+  (setf **wrote** t **txn-dirty** t)
   (let ((st **st-insert-post**) (start **wp**))
     (%bind-int64 st 1 user-id)
     (%bind-text st 2 body n 0)
